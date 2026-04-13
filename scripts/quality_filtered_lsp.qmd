@@ -1,9 +1,0 @@
----
-title: "filter_lsp"
-format: html
-editor: visual
----
-
-## Suggested code for filtering lsp
-
-Data provided is the extracted lsp for wintermoth sample location, along with the quality assessment
