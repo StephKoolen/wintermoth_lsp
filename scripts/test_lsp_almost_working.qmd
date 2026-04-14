@@ -22,7 +22,7 @@ library(stringr)
 sin_crs    <- "+proj=sinu +lon_0=0 +x_0=0 +y_0=0 +a=6371007.181 +b=6371007.181 +units=m +no_defs"
 wgs_crs    <- "EPSG:4326"
 target_year <- 2013
-plot_dir    <- "site_figures"
+plot_dir    <- "../figures"
 dir.create(plot_dir, showWarnings = FALSE)
 ```
 
@@ -81,7 +81,13 @@ decode_glsp_qc <- function(qc) {
 }
 
 fetch_satellite_basemap <- function(buf_wgs) {
+  # Use a slightly expanded bbox to ensure full coverage
   bb <- st_bbox(buf_wgs)
+  pad <- 0.01  # ~1 km padding in degrees
+  bb["xmin"] <- bb["xmin"] - pad
+  bb["ymin"] <- bb["ymin"] - pad
+  bb["xmax"] <- bb["xmax"] + pad
+  bb["ymax"] <- bb["ymax"] + pad
 
   url <- sprintf(
     paste0(
@@ -125,7 +131,7 @@ clc_df_from_rast <- function(r, clc_lookup) {
 ```
 
 ```{r}
-wm_location <- read.csv("../../data/wgs_europe_metadata.csv") %>%
+wm_location <- read.csv("../../wintermoth_data/wgs_europe_metadata.csv") %>%
   distinct(pop, latitude, longitude, .keep_all = TRUE)
 ```
 
@@ -153,7 +159,7 @@ buf_vect <- vect(square_buffers)
 
 ```{r Coring land cover classification}
 
-clc_rast <- rast("../../data/CLC/data/U2018_CLC2018_V2020_20u1.tif")
+clc_rast <- rast("../../wintermoth_data/CLC/data/U2018_CLC2018_V2020_20u1.tif")
 clc_crs  <- crs(clc_rast)
 if (nlyr(clc_rast) > 1) clc_rast <- clc_rast[[1]]
 
@@ -356,8 +362,8 @@ ggsave(
 
 ```{r}
 
-files <- list.files("../../data/VIIRS", pattern = "VNP22Q2.*\\.h5$", full.names = TRUE)
-years <- as.integer(substr(basename(files), 10, 13))
+files <- list.files("../../wintermoth_data/VIIRS", pattern = "VNP22Q2.*\\.h5$", full.names = TRUE)
+years <- as.integer(regmatches(basename(files), regexpr("\\d{4}", basename(files))))
 year_files <- files[years == target_year]
 
 extract_vnp <- function(filepath, year) {
@@ -405,6 +411,8 @@ extract_vnp <- function(filepath, year) {
 
 tile_results <- lapply(year_files, extract_vnp, year = target_year)
 ```
+
+
 ```{r}
 all_extracts <- lapply(tile_results, function(tile) {
 
@@ -431,8 +439,11 @@ all_extracts <- lapply(tile_results, function(tile) {
   )
   if (is.null(extracted) || nrow(extracted) == 0) return(NULL)
 
-  buf_df            <- as.data.frame(buf_subset)
-  extracted$pop     <- buf_df$pop[extracted$ID]
+  buf_df <- as.data.frame(buf_subset) %>%
+  mutate(.row_id = seq_len(n()))
+
+  extracted <- extracted %>%
+  left_join(buf_df %>% select(.row_id, pop), by = c("ID" = ".row_id"))
   extracted$tile_id <- tile_id
   extracted$year    <- target_year
   names(extracted)[names(extracted) == "cell"] <- "pixel_id"
@@ -463,7 +474,7 @@ all_extracts <- lapply(tile_results, function(tile) {
   extracted
 })
 
-final_long <- bind_rows(all_extracts) %>%
+final_long <- bind_rows(Filter(Negate(is.null), all_extracts)) %>%
   select(
     pop, tile_id, year, pixel_id, x, y,
     Onset_Greenness_Increase, GLSP_QC, PGQ_Onset_Greenness_Increase,
@@ -476,154 +487,137 @@ final_long <- bind_cols(final_long, decode_glsp_qc(final_long$GLSP_QC)) %>%
 ```
 
 ```{r}
-site_to_run <- (square_buffers$pop)
-message("Generating figures for site: ", site_to_run)
-
-site_buf_sin <- square_buffers %>% filter(pop == site_to_run)
-site_buf_wgs  <- st_transform(site_buf_sin, wgs_crs)
-site_buf_clc  <- st_transform(site_buf_sin, clc_crs)
-
-site_pt_wgs <- location_sf %>% filter(pop == site_to_run)
-site_pt_sin <- st_transform(site_pt_wgs, sin_crs)
-site_pt_clc <- st_transform(site_pt_wgs, clc_crs)
-
-site_extract <- final_long %>%
-  filter(pop == site_to_run)
-
-site_pixels <- site_extract %>%
-  select(x, y, Onset_Greenness_Increase) %>%
-  group_by(x, y) %>%
-  summarise(Onset_Greenness_Increase = first(Onset_Greenness_Increase), .groups = "drop") %>%
-  filter(!is.na(x), !is.na(y))
-
-viirs_res <- res(tile_results[[1]]$raster)[1]
-hx <- viirs_res / 2
-hy <- viirs_res / 2
-
-site_pixel_sf <- st_sf(
-  site_pixels,
-  geometry = st_sfc(
-    lapply(seq_len(nrow(site_pixels)), function(i) {
-      make_square(site_pixels$x[i], site_pixels$y[i], hx, hy)
-    }),
-    crs = sin_crs
+for (site_to_run in unique(square_buffers$pop)) {
+  message("Generating figures for site: ", site_to_run)
+  
+  site_buf_sin <- square_buffers %>% filter(pop == site_to_run)
+  site_buf_wgs <- st_transform(site_buf_sin, wgs_crs)
+  site_buf_clc <- st_transform(site_buf_sin, clc_crs)
+  
+  site_pt_wgs <- location_sf %>% filter(pop == site_to_run)
+  site_pt_sin <- st_transform(site_pt_wgs, sin_crs)
+  site_pt_clc <- st_transform(site_pt_wgs, clc_crs)
+  
+  site_extract <- final_long %>% filter(pop == site_to_run)
+  
+  # Skip if no data for this site
+  if (nrow(site_extract) == 0) {
+    message("  No VIIRS data for ", site_to_run, " — skipping")
+    next
+  }
+  
+  site_pixels <- site_extract %>%
+    select(x, y, Onset_Greenness_Increase) %>%
+    group_by(x, y) %>%
+    summarise(Onset_Greenness_Increase = first(Onset_Greenness_Increase), .groups = "drop") %>%
+    filter(!is.na(x), !is.na(y))
+  
+  viirs_res <- res(tile_results[[1]]$raster)[1]
+  hx <- viirs_res / 2
+  hy <- viirs_res / 2
+  
+  site_pixel_sf <- st_sf(
+    site_pixels,
+    geometry = st_sfc(
+      lapply(seq_len(nrow(site_pixels)), function(i) {
+        make_square(site_pixels$x[i], site_pixels$y[i], hx, hy)
+      }),
+      crs = sin_crs
+    )
   )
+  
+  # Fix: define clc_site_sin before it's used
+clc_site_nat <- crop(clc_rast, vect(site_buf_clc))
+
+# Set factor levels so geom_spatraster maps colours correctly
+levels(clc_site_nat) <- data.frame(
+  value    = clc_palette_df$clc_code,
+  clc_name = clc_palette_df$clc_label
 )
 
-site_pixel_clc <- st_transform(site_pixel_sf, clc_crs)
-site_pixel_wgs <- st_transform(site_pixel_sf, wgs_crs)
-
-# Panel 1: LSP
-p1 <- ggplot() +
-  geom_sf(
-    data = site_pixel_sf,
-    aes(fill = Onset_Greenness_Increase),
-    colour = "grey35",
-    linewidth = 0.15
-  ) +
-  geom_sf(data = site_buf_sin, fill = NA, colour = "red", linewidth = 0.8) +
-  geom_sf(data = site_pt_sin, shape = 4, size = 3.5, stroke = 1.2, colour = "black") +
-  scale_fill_gradientn(
-    colours = hcl.colors(100, "RdYlGn"),
-    name = "Day of year",
-    na.value = "grey80"
-  ) +
-  coord_sf(crs = sin_crs) +
-  labs(
-    title = paste0(site_to_run, " — LSP Onset of Greenness (", target_year, ")"),
-    subtitle = "Grey lines = VIIRS pixel borders; X = sampling point"
-  ) +
-  theme_minimal(base_size = 10)
-
-# Panel 2: CLC native
-clc_site_nat <- crop(clc_rast, vect(site_buf_clc))
-clc_df_nat <- clc_df_nat %>%
-  mutate(clc_name = factor(clc_name, levels = clc_levels))
-
-site_pixel_sf <- site_pixel_sf %>%
-  mutate(clc_code = as.integer(exact_extract(clc_site_sin, site_pixel_sf, "mode"))) %>%
-  left_join(clc_palette_df %>% dplyr::select(clc_code, clc_name), by = "clc_code") %>%
-  mutate(clc_name = factor(clc_name, levels = clc_levels))
-
-p2 <- ggplot() +
-  geom_raster(data = clc_df_nat, aes(x = x, y = y, fill = clc_name)) +
-  geom_sf(data = site_pixel_clc, fill = NA, colour = "grey35", linewidth = 0.15) +
-  geom_sf(data = site_buf_clc, fill = NA, colour = "red", linewidth = 0.8) +
-  geom_sf(data = site_pt_clc, shape = 4, size = 3.5, stroke = 1.2, colour = "black") +
-  scale_fill_manual(
-  values = clc_palette,
-  drop = FALSE,
-  na.value = "grey80",
-  name = "CLC class",
-  guide = "none"
-  ) +
-  labs(title = "CLC — native resolution") +
-  theme_minimal(base_size = 10) +
-  theme(
-    legend.text = element_text(size = 6),
-    legend.key.size = unit(0.4, "cm")
-  )
-
-# Panel 3: CLC resampled to VIIRS pixel grid
 clc_site_sin <- project(clc_site_nat, sin_crs, method = "near")
 
-
-p3 <- ggplot() +
-  geom_sf(data = site_pixel_sf, aes(fill = clc_name), colour = "grey35", linewidth = 0.15) +
-  geom_sf(data = site_buf_sin, fill = NA, colour = "red", linewidth = 0.8) +
-  geom_sf(data = site_pt_sin, shape = 4, size = 3.5, stroke = 1.2, colour = "black") +
-  scale_fill_manual(
-  values = clc_palette,
-  drop = FALSE,
-  na.value = "grey80",
-  name = "CLC class",
-  guide = "none"
-  ) +
-  coord_sf(crs = sin_crs) +
-  labs(title = "CLC — resampled to the VIIRS pixel grid") +
-  theme_minimal(base_size = 10) +
-  theme(
-    legend.text = element_text(size = 6),
-    legend.key.size = unit(0.4, "cm")
-  )
-
-# Panel 4: Satellite
-sat <- fetch_satellite_basemap(site_buf_wgs)
-
-if (!is.null(sat) && nlyr(sat) >= 3) {
-  sat_rgb <- sat[[1:3]]
-  names(sat_rgb) <- c("r", "g", "b")
-
-  p4 <- ggplot() +
-    tidyterra::geom_spatraster_rgb(data = sat_rgb) +
-    geom_sf(data = site_pixel_wgs, fill = NA, colour = "grey35", linewidth = 0.15) +
-    geom_sf(data = site_buf_wgs, fill = NA, colour = "red", linewidth = 0.8) +
-    geom_sf(data = site_pt_wgs, shape = 4, size = 3.5, stroke = 1.2, colour = "black") +
-    coord_sf(crs = wgs_crs, expand = FALSE) +
-    labs(title = "Satellite image (ESRI World Imagery)") +
+  
+  site_pixel_clc <- st_transform(site_pixel_sf, clc_crs)
+  site_pixel_wgs <- st_transform(site_pixel_sf, wgs_crs)
+  
+  site_pixel_sf <- site_pixel_sf %>%
+    mutate(clc_code = as.integer(exact_extract(clc_site_sin, site_pixel_sf, "mode"))) %>%
+    left_join(clc_palette_df %>% select(clc_code, clc_label), by = "clc_code") %>%
+    mutate(clc_label = factor(clc_label, levels = clc_levels))
+  
+  # --- panels (unchanged from your original, just using clc_label not clc_name) ---
+  p1 <- ggplot() +
+    geom_sf(data = site_pixel_sf, aes(fill = Onset_Greenness_Increase),
+            colour = "grey35", linewidth = 0.15) +
+    geom_sf(data = site_buf_sin, fill = NA, colour = "red", linewidth = 0.8) +
+    geom_sf(data = site_pt_sin, shape = 4, size = 3.5, stroke = 1.2, colour = "black") +
+    scale_fill_gradientn(colours = hcl.colors(100, "RdYlGn"),
+                         name = "Day of year", na.value = "grey80") +
+    coord_sf(crs = sin_crs) +
+    labs(title = paste0(site_to_run, " — LSP Onset of Greenness (", target_year, ")"),
+         subtitle = "Grey lines = VIIRS pixel borders; X = sampling point") +
     theme_minimal(base_size = 10)
-} else {
-  p4 <- ggplot() +
-    annotate("text", x = 0.5, y = 0.5, label = "Satellite image unavailable") +
-    theme_void()
-}
 
-bottom_row <- (p2 | p3) +
-  plot_layout(guides = "collect") &
-  theme(legend.position = "bottom")
+# Replace the p2 block with this:
+p2 <- ggplot() +
+  tidyterra::geom_spatraster(data = clc_site_nat, aes(fill = clc_name)) +
+  geom_sf(data = site_pixel_clc, fill = NA, colour = "grey35", linewidth = 0.15) +
+  geom_sf(data = site_buf_clc,   fill = NA, colour = "red",    linewidth = 0.8) +
+  geom_sf(data = site_pt_clc,    shape = 4, size = 3.5, stroke = 1.2, colour = "black") +
+  scale_fill_manual(
+    values    = clc_palette,
+    drop      = FALSE,
+    na.value  = "grey80",
+    name      = "CLC class",
+    guide     = "none"
+  ) +
+  labs(title = "CLC — native resolution") +
+  theme_minimal(base_size = 10)
 
-combined <- (p1 | p4) / bottom_row +
-  plot_annotation(
-    title = paste0("Site: ", site_to_run, " | ", target_year),
-    caption = "Red box = 5×5 km buffer | Grey lines = VIIRS pixel borders | X = sampling point"
+  p3 <- ggplot() +
+    geom_sf(data = site_pixel_sf, aes(fill = clc_label),
+            colour = "grey35", linewidth = 0.15) +
+    geom_sf(data = site_buf_sin, fill = NA, colour = "red", linewidth = 0.8) +
+    geom_sf(data = site_pt_sin, shape = 4, size = 3.5, stroke = 1.2, colour = "black") +
+    scale_fill_manual(values = clc_palette, drop = FALSE,
+                      na.value = "grey80", name = "CLC class", guide = "none") +
+    coord_sf(crs = sin_crs) +
+    labs(title = "CLC — resampled to the VIIRS pixel grid") +
+    theme_minimal(base_size = 10)
+
+  sat <- fetch_satellite_basemap(site_buf_wgs)
+  if (!is.null(sat) && nlyr(sat) >= 3) {
+    sat_rgb <- sat[[1:3]]
+    names(sat_rgb) <- c("r", "g", "b")
+    p4 <- ggplot() +
+      tidyterra::geom_spatraster_rgb(data = sat_rgb) +
+      geom_sf(data = site_pixel_wgs, fill = NA, colour = "grey35", linewidth = 0.15) +
+      geom_sf(data = site_buf_wgs, fill = NA, colour = "red", linewidth = 0.8) +
+      geom_sf(data = site_pt_wgs, shape = 4, size = 3.5, stroke = 1.2, colour = "black") +
+      coord_sf(crs = wgs_crs, expand = FALSE) +
+      labs(title = "Satellite image (ESRI World Imagery)") +
+      theme_minimal(base_size = 10)
+  } else {
+    p4 <- ggplot() +
+      annotate("text", x = 0.5, y = 0.5, label = "Satellite image unavailable") +
+      theme_void()
+  }
+
+  combined <- (p1 | p4) / (p2 | p3) +
+    plot_annotation(
+      title   = paste0("Site: ", site_to_run, " | ", target_year),
+      caption = "Red box = 5×5 km buffer | Grey lines = VIIRS pixel borders | X = sampling point"
+    )
+
+  ggsave(
+    filename = file.path(plot_dir, paste0(site_to_run, "_", target_year, ".png")),
+    plot     = combined,
+    width = 14, height = 10, dpi = 150
   )
-
-ggsave(
-  filename = file.path(plot_dir, paste0(site_to_run, "_", target_year, ".png")),
-  plot = combined,
-  width = 14, height = 10, dpi = 150
-)
-
+  
+  message("  Saved: ", site_to_run, "_", target_year, ".png")
+}
 ```
 
 ```{r}
