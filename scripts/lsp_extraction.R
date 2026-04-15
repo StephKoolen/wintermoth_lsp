@@ -7,14 +7,10 @@ library(stringr)
 # ── CRS & paths ───────────────────────────────────────────────────────────────
 sin_crs  <- "+proj=sinu +lon_0=0 +x_0=0 +y_0=0 +a=6371007.181 +b=6371007.181 +units=m +no_defs"
 wgs_crs  <- "EPSG:4326"
-
-viirs_dir  <- "../../wintermoth_data/VIIRS"
-clc_path   <- "../../wintermoth_data/CLC/data/U2018_CLC2018_V2020_20u1.tif"
-meta_path  <- "../../wintermoth_data/wgs_europe_metadata.csv"
-out_dir    <- "../output"
+out_dir  <- "../output"
 dir.create(out_dir, showWarnings = FALSE)
 
-# ── Helper ────────────────────────────────────────────────────────────────────
+# ── Helper functions ───────────────────────────────────────────────────────────
 make_square <- function(x, y, hx, hy) {
   st_polygon(list(matrix(c(
     x - hx, y - hy,
@@ -25,53 +21,6 @@ make_square <- function(x, y, hx, hy) {
   ), ncol = 2, byrow = TRUE)))
 }
 
-# ── Site buffers ──────────────────────────────────────────────────────────────
-wm_location <- read.csv(meta_path) %>%
-  distinct(pop, latitude, longitude, .keep_all = TRUE)
-
-location_sf  <- st_as_sf(wm_location, coords = c("longitude", "latitude"), crs = 4326)
-location_sin <- st_transform(location_sf, crs = sin_crs)
-coords       <- st_coordinates(location_sin)
-half         <- 2500
-
-squares <- mapply(
-  make_square,
-  coords[, 1], coords[, 2],
-  MoreArgs = list(hx = half, hy = half),
-  SIMPLIFY = FALSE
-)
-
-square_buffers <- st_sf(
-  st_drop_geometry(location_sin),
-  geometry = st_sfc(squares, crs = sin_crs)
-)
-
-buf_vect <- vect(square_buffers)
-
-# ── CLC — extract once per site ───────────────────────────────────────────────
-message("Loading CLC raster...")
-clc_rast <- rast(clc_path)
-clc_crs  <- crs(clc_rast)
-if (nlyr(clc_rast) > 1) clc_rast <- clc_rast[[1]]
-
-message("Extracting CLC per site...")
-buf_vect_clc <- project(buf_vect, clc_crs)
-
-clc_extracted <- exact_extract(
-  clc_rast,
-  st_as_sf(buf_vect_clc),
-  fun       = "mode",
-  append_cols = FALSE
-)
-
-clc_per_site <- square_buffers %>%
-  st_drop_geometry() %>%
-  select(pop) %>%
-  mutate(clc_code = as.integer(clc_extracted))
-
-message("CLC extraction done.")
-
-# ── VIIRS — extract per year ───────────────────────────────────────────────────
 decode_glsp_qc <- function(qc) {
   mandatory_raw <- bitwAnd(qc, 0x03)
   mandatory <- dplyr::case_when(
@@ -120,7 +69,7 @@ extract_vnp <- function(filepath, year) {
   
   xmin <- (tile_h - 18) * tile_size
   xmax <- xmin + tile_size
-  ymax <- (9 - tile_v)  * tile_size
+  ymax <- (9  - tile_v) * tile_size
   ymin <- ymax - tile_size
   tile_ext <- ext(xmin, xmax, ymin, ymax)
   
@@ -132,9 +81,7 @@ extract_vnp <- function(filepath, year) {
   qc    <- flip(rast(qc_path),    direction = "vertical")
   pgq   <- flip(rast(pgq_path),   direction = "vertical")
   
-  ext(onset) <- tile_ext; crs(onset) <- sin_crs
-  ext(qc)    <- tile_ext; crs(qc)    <- sin_crs
-  ext(pgq)   <- tile_ext; crs(pgq)   <- sin_crs
+  for (r in list(onset, qc, pgq)) { ext(r) <- tile_ext; crs(r) <- sin_crs }
   
   offset          <- (year - 2000) * 366
   onset_corrected <- app(onset, function(x) ifelse(x == 32767, NA, x - offset))
@@ -152,19 +99,55 @@ extract_vnp <- function(filepath, year) {
   list(raster = c(onset_corrected, qc_clean, pgq_clean), tile_id = tile_str)
 }
 
-# ── Loop over all years found in the VIIRS directory ─────────────────────────
-all_files <- list.files(viirs_dir, pattern = "VNP22Q2.*\\.h5$", full.names = TRUE)
+# ── Site buffers ───────────────────────────────────────────────────────────────
+wm_location <- read.csv("../../wintermoth_data/wgs_europe_metadata.csv") %>%
+  distinct(pop, latitude, longitude, .keep_all = TRUE)
 
-if (length(all_files) == 0) stop("No VIIRS .h5 files found in: ", viirs_dir)
+location_sf  <- st_as_sf(wm_location, coords = c("longitude", "latitude"), crs = 4326)
+location_sin <- st_transform(location_sf, crs = sin_crs)
+coords       <- st_coordinates(location_sin)
+half         <- 2500
 
-all_years <- as.integer(regmatches(basename(all_files), regexpr("\\d{4}", basename(all_files))))
-message("Years found: ", paste(sort(unique(all_years)), collapse = ", "))
+square_buffers <- st_sf(
+  st_drop_geometry(location_sin),
+  geometry = st_sfc(
+    mapply(make_square,
+           coords[, 1], coords[, 2],
+           MoreArgs = list(hx = half, hy = half),
+           SIMPLIFY = FALSE),
+    crs = sin_crs
+  )
+)
+buf_vect <- vect(square_buffers)
 
-results_by_year <- list()
+# ── CLC (extracted once; labels joined later) ──────────────────────────────────
+clc_rast <- rast("../../wintermoth_data/CLC/data/U2018_CLC2018_V2020_20u1.tif")
+clc_crs  <- crs(clc_rast)
+if (nlyr(clc_rast) > 1) clc_rast <- clc_rast[[1]]
 
-for (yr in sort(unique(all_years))) {
-  message("\nProcessing year: ", yr)
-  year_files   <- all_files[all_years == yr]
+clc_lookup <- terra::levels(clc_rast)[[1]] %>%
+  as_tibble() %>%
+  rename(clc_code = Value, clc_name = LABEL3) %>%
+  mutate(clc_code = as.integer(clc_code)) %>%
+  filter(clc_code != 48)
+
+# ── Discover all years in the VIIRS folder ─────────────────────────────────────
+all_files <- list.files("../../wintermoth_data/VIIRS",
+                        pattern = "VNP22Q2.*\\.h5$", full.names = TRUE)
+all_years <- sort(unique(
+  as.integer(regmatches(basename(all_files),
+                        regexpr("\\d{4}", basename(all_files))))
+))
+message("Years found: ", paste(all_years, collapse = ", "))
+
+# ── Main extraction loop (one year at a time) ──────────────────────────────────
+all_years_long <- vector("list", length(all_years))
+
+for (yi in seq_along(all_years)) {
+  yr <- all_years[yi]
+  message("\n── Year ", yr, " ──────────────────────────────────")
+  
+  year_files   <- all_files[grepl(as.character(yr), basename(all_files))]
   tile_results <- lapply(year_files, extract_vnp, year = yr)
   
   year_extracts <- lapply(tile_results, function(tile) {
@@ -173,52 +156,106 @@ for (yr in sort(unique(all_years))) {
     
     tile_poly     <- as.polygons(ext(r), crs = sin_crs)
     buf_intersect <- relate(buf_vect, tile_poly, relation = "intersects")
-    buf_subset    <- buf_vect[apply(buf_intersect, 1, any), ]
+    buf_subset    <- buf_vect[buf_intersect, ]
     if (nrow(buf_subset) == 0) return(NULL)
     
-    r_crop    <- crop(r, buf_subset)
-    extracted <- extract(r_crop, buf_subset, fun = "mean", na.rm = TRUE, ID = TRUE)
+    r_crop <- crop(r, buf_subset)
+    
+    # CLC: project tile footprint → native CLC crs, crop, reproject to sinusoidal
+    tile_poly_clc <- project(tile_poly, clc_crs)
+    clc_crop_sin  <- project(crop(clc_rast, tile_poly_clc), sin_crs, method = "near")
+    
+    extracted <- extract(r_crop, buf_subset,
+                         fun = NULL, ID = TRUE, cells = TRUE, xy = TRUE)
     if (is.null(extracted) || nrow(extracted) == 0) return(NULL)
     
-    buf_df <- as.data.frame(buf_subset) %>%
-      mutate(.row_id = seq_len(n()))
+    buf_df <- as.data.frame(buf_subset) %>% mutate(.row_id = seq_len(n()))
+    
+    extracted <- extracted %>%
+      left_join(buf_df %>% select(.row_id, pop), by = c("ID" = ".row_id")) %>%
+      rename(pixel_id = cell)
+    
+    extracted$tile_id <- tile_id
+    extracted$year    <- yr
+    
+    # Build pixel polygons → extract modal CLC code
+    pixel_tbl <- extracted %>% distinct(pixel_id, x, y)
+    hx <- res(r_crop)[1] / 2
+    hy <- res(r_crop)[2] / 2
+    
+    pixel_sf <- st_sf(
+      pixel_tbl,
+      geometry = st_sfc(
+        lapply(seq_len(nrow(pixel_tbl)), function(i)
+          make_square(pixel_tbl$x[i], pixel_tbl$y[i], hx, hy)),
+        crs = sin_crs
+      )
+    )
+    pixel_sf$clc_code <- as.integer(exact_extract(clc_crop_sin, pixel_sf, "mode"))
     
     extracted %>%
-      left_join(buf_df %>% select(.row_id, pop), by = c("ID" = ".row_id")) %>%
-      mutate(tile_id = tile_id, year = yr) %>%
+      left_join(st_drop_geometry(pixel_sf) %>% select(pixel_id, clc_code),
+                by = "pixel_id") %>%
       select(-ID)
   })
   
-  year_long <- bind_rows(Filter(Negate(is.null), year_extracts))
+  year_long <- bind_rows(Filter(Negate(is.null), year_extracts)) %>%
+    select(pop, tile_id, year, pixel_id, x, y,
+           Onset_Greenness_Increase, GLSP_QC, PGQ_Onset_Greenness_Increase,
+           clc_code) %>%
+    arrange(pop, tile_id, pixel_id)
   
-  if (nrow(year_long) == 0) {
-    message("  No data extracted for ", yr, " — skipping")
-    next
-  }
+  # Decode QC flags & attach CLC label
+  year_long <- bind_cols(year_long, decode_glsp_qc(year_long$GLSP_QC)) %>%
+    left_join(clc_lookup, by = "clc_code")
   
-  results_by_year[[as.character(yr)]] <- year_long
-  message("  Extracted ", nrow(year_long), " site-year rows for ", yr)
+  all_years_long[[yi]] <- year_long
+  message("  Rows extracted: ", nrow(year_long))
 }
 
-# ── Combine, decode QC, join CLC ──────────────────────────────────────────────
-message("\nCombining all years...")
+# ── Combine & write long format ────────────────────────────────────────────────
+final_long <- bind_rows(all_years_long) %>%
+  arrange(pop, year, tile_id, pixel_id)
 
-final_long <- bind_rows(results_by_year) %>%
-  filter(!is.na(pop)) %>%
-  left_join(clc_per_site, by = "pop") %>%
-  bind_cols(decode_glsp_qc(.$GLSP_QC)) %>%
-  select(
-    pop, year, tile_id,
-    Onset_Greenness_Increase, GLSP_QC, PGQ_Onset_Greenness_Increase,
-    QC_mandatory_quality, QC_climatology, QC_land_water,
-    clc_code
-  ) %>%
-  arrange(pop, year)
+write.csv(final_long,
+          file.path(out_dir, "wm_lsp_clc_long.csv"),
+          row.names = FALSE)
+message("Long format written: wm_lsp_clc_long.csv  (", nrow(final_long), " rows)")
 
-# ── Save ──────────────────────────────────────────────────────────────────────
-out_path <- file.path(out_dir, "wm_lsp_clc_all_years.csv")
-write.csv(final_long, out_path, row.names = FALSE)
-message("Saved to: ", out_path)
-message("Done. ", nrow(final_long), " rows, ", n_distinct(final_long$pop), " sites, ",
-        n_distinct(final_long$year), " years.")
+# ── Wide format ────────────────────────────────────────────────────────────────
+# One row per pixel (pop × pixel_id), one column per year for each LSP variable.
+# CLC code/name are stable across years so we take the modal value.
 
+stable_cols <- final_long %>%
+  group_by(pop, pixel_id) %>%
+  summarise(
+    x        = first(x),
+    y        = first(y),
+    tile_id  = first(tile_id),
+    clc_code = as.integer(names(sort(table(clc_code), decreasing = TRUE))[1]),
+    clc_name = as.character(names(sort(table(clc_name), decreasing = TRUE))[1]),
+    .groups  = "drop"
+  )
+
+lsp_wide <- final_long %>%
+  select(pop, pixel_id, year,
+         Onset_Greenness_Increase, GLSP_QC, PGQ_Onset_Greenness_Increase,
+         QC_mandatory_quality, QC_climatology, QC_land_water) %>%
+  tidyr::pivot_wider(
+    names_from  = year,
+    values_from = c(Onset_Greenness_Increase, GLSP_QC, PGQ_Onset_Greenness_Increase,
+                    QC_mandatory_quality, QC_climatology, QC_land_water),
+    names_glue  = "{.value}_{year}"
+  )
+
+final_wide <- stable_cols %>%
+  left_join(lsp_wide, by = c("pop", "pixel_id")) %>%
+  arrange(pop, pixel_id)
+
+write.csv(final_wide,
+          file.path(out_dir, "wm_lsp_clc_wide.csv"),
+          row.names = FALSE)
+message("Wide format written: wm_lsp_clc_wide.csv  (", nrow(final_wide), " rows, ",
+        ncol(final_wide), " columns)")
+
+message("\nDone.")
