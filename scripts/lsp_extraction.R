@@ -100,24 +100,9 @@ extract_vnp <- function(filepath, year) {
 }
 
 # ── Site buffers ───────────────────────────────────────────────────────────────
-wm_location <- read.csv("../../wintermoth_data/wgs_europe_metadata.csv") %>%
-  distinct(pop, latitude, longitude, .keep_all = TRUE)
+square_buffers <- st_read("../../wintermoth_data/10kmbuffers.shp") %>%
+  st_transform(crs = sin_crs)
 
-location_sf  <- st_as_sf(wm_location, coords = c("longitude", "latitude"), crs = 4326)
-location_sin <- st_transform(location_sf, crs = sin_crs)
-coords       <- st_coordinates(location_sin)
-half         <- 2500
-
-square_buffers <- st_sf(
-  st_drop_geometry(location_sin),
-  geometry = st_sfc(
-    mapply(make_square,
-           coords[, 1], coords[, 2],
-           MoreArgs = list(hx = half, hy = half),
-           SIMPLIFY = FALSE),
-    crs = sin_crs
-  )
-)
 buf_vect <- vect(square_buffers)
 
 # ── CLC (extracted once; labels joined later) ──────────────────────────────────
