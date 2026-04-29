@@ -1,6 +1,7 @@
 library(terra)
 library(sf)
 library(dplyr)
+library(tidyr)
 library(exactextractr)
 library(stringr)
 
@@ -101,7 +102,8 @@ extract_vnp <- function(filepath, year) {
 
 # ── Site buffers ───────────────────────────────────────────────────────────────
 square_buffers <- st_read("../../wintermoth_data/10kmbuffers.shp") %>%
-  st_transform(crs = sin_crs)
+  st_transform(crs = sin_crs) %>% 
+  unite(pop_id, pop, ID, sep = "_")
 
 buf_vect <- vect(square_buffers)
 
@@ -150,14 +152,14 @@ for (yi in seq_along(all_years)) {
     tile_poly_clc <- project(tile_poly, clc_crs)
     clc_crop_sin  <- project(crop(clc_rast, tile_poly_clc), sin_crs, method = "near")
     
-    extracted <- extract(r_crop, buf_subset,
+    extracted <- terra::extract(r_crop, buf_subset,
                          fun = NULL, ID = TRUE, cells = TRUE, xy = TRUE)
     if (is.null(extracted) || nrow(extracted) == 0) return(NULL)
     
     buf_df <- as.data.frame(buf_subset) %>% mutate(.row_id = seq_len(n()))
     
     extracted <- extracted %>%
-      left_join(buf_df %>% select(.row_id, pop), by = c("ID" = ".row_id")) %>%
+      left_join(buf_df %>% select(.row_id, pop_id), by = c("ID" = ".row_id")) %>%
       rename(pixel_id = cell)
     
     extracted$tile_id <- tile_id
@@ -185,10 +187,10 @@ for (yi in seq_along(all_years)) {
   })
   
   year_long <- bind_rows(Filter(Negate(is.null), year_extracts)) %>%
-    select(pop, tile_id, year, pixel_id, x, y,
+    select(pop_id, tile_id, year, pixel_id, x, y,
            Onset_Greenness_Increase, GLSP_QC, PGQ_Onset_Greenness_Increase,
            clc_code) %>%
-    arrange(pop, tile_id, pixel_id)
+    arrange(pop_id, tile_id, pixel_id)
   
   # Decode QC flags & attach CLC label
   year_long <- bind_cols(year_long, decode_glsp_qc(year_long$GLSP_QC)) %>%
@@ -200,7 +202,7 @@ for (yi in seq_along(all_years)) {
 
 # ── Combine & write long format ────────────────────────────────────────────────
 final_long <- bind_rows(all_years_long) %>%
-  arrange(pop, year, tile_id, pixel_id)
+  arrange(pop_id, year, tile_id, pixel_id)
 
 write.csv(final_long,
           file.path(out_dir, "wm_lsp_clc_long.csv"),
@@ -208,11 +210,11 @@ write.csv(final_long,
 message("Long format written: wm_lsp_clc_long.csv  (", nrow(final_long), " rows)")
 
 # ── Wide format ────────────────────────────────────────────────────────────────
-# One row per pixel (pop × pixel_id), one column per year for each LSP variable.
+# One row per pixel (pop_id × pixel_id), one column per year for each LSP variable.
 # CLC code/name are stable across years so we take the modal value.
 
 stable_cols <- final_long %>%
-  group_by(pop, pixel_id) %>%
+  group_by(pop_id, pixel_id) %>%
   summarise(
     x        = first(x),
     y        = first(y),
@@ -223,7 +225,7 @@ stable_cols <- final_long %>%
   )
 
 lsp_wide <- final_long %>%
-  select(pop, pixel_id, year,
+  select(pop_id, pixel_id, year,
          Onset_Greenness_Increase, GLSP_QC, PGQ_Onset_Greenness_Increase,
          QC_mandatory_quality, QC_climatology, QC_land_water) %>%
   tidyr::pivot_wider(
@@ -234,8 +236,8 @@ lsp_wide <- final_long %>%
   )
 
 final_wide <- stable_cols %>%
-  left_join(lsp_wide, by = c("pop", "pixel_id")) %>%
-  arrange(pop, pixel_id)
+  left_join(lsp_wide, by = c("pop_id", "pixel_id")) %>%
+  arrange(pop_id, pixel_id)
 
 write.csv(final_wide,
           file.path(out_dir, "wm_lsp_clc_wide.csv"),

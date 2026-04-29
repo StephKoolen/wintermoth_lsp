@@ -131,13 +131,9 @@ clc_df_from_rast <- function(r, clc_lookup) {
 ```
 
 ```{r}
-wm_location <- read.csv("../../wintermoth_data/wgs_europe_metadata.csv") %>%
-  distinct(pop, latitude, longitude, .keep_all = TRUE)
-
-location_sf <- st_as_sf(wm_location, coords = c("longitude", "latitude"), crs = 4326)
-
 square_buffers <- st_read("../../wintermoth_data/10kmbuffers.shp") %>%
-  st_transform(crs = sin_crs)
+  st_transform(crs = sin_crs) %>% 
+  unite(pop_id, pop, ID, sep = "_")
 
 buf_vect <- vect(square_buffers)
 ```
@@ -414,7 +410,7 @@ all_extracts <- lapply(tile_results, function(tile) {
   clc_crop_nat  <- crop(clc_rast, tile_poly_clc)
   clc_crop_sin  <- project(clc_crop_nat, sin_crs, method = "near")
 
-  extracted <- extract(
+  extracted <- terra::extract(
     r_crop,
     buf_subset,
     fun = NULL,
@@ -428,7 +424,7 @@ all_extracts <- lapply(tile_results, function(tile) {
   mutate(.row_id = seq_len(n()))
 
   extracted <- extracted %>%
-  left_join(buf_df %>% select(.row_id, pop), by = c("ID" = ".row_id"))
+  left_join(buf_df %>% select(.row_id, pop_id), by = c("ID" = ".row_id"))
   extracted$tile_id <- tile_id
   extracted$year    <- target_year
   names(extracted)[names(extracted) == "cell"] <- "pixel_id"
@@ -461,29 +457,25 @@ all_extracts <- lapply(tile_results, function(tile) {
 
 final_long <- bind_rows(Filter(Negate(is.null), all_extracts)) %>%
   select(
-    pop, tile_id, year, pixel_id, x, y,
+    pop_id, tile_id, year, pixel_id, x, y,
     Onset_Greenness_Increase, GLSP_QC, PGQ_Onset_Greenness_Increase,
     clc_code
   ) %>%
-  arrange(pop, tile_id, pixel_id)
+  arrange(pop_id, tile_id, pixel_id)
 
 final_long <- bind_cols(final_long, decode_glsp_qc(final_long$GLSP_QC)) %>%
   left_join(clc_lookup, by = "clc_code")
 ```
 
 ```{r}
-for (site_to_run in unique(square_buffers$pop)) {
+for (site_to_run in unique(square_buffers$pop_id)) {
   message("Generating figures for site: ", site_to_run)
   
-  site_buf_sin <- square_buffers %>% filter(pop == site_to_run)
+  site_buf_sin <- square_buffers %>% filter(pop_id == site_to_run)
   site_buf_wgs <- st_transform(site_buf_sin, wgs_crs)
   site_buf_clc <- st_transform(site_buf_sin, clc_crs)
   
-  site_pt_wgs <- location_sf %>% filter(pop == site_to_run)
-  site_pt_sin <- st_transform(site_pt_wgs, sin_crs)
-  site_pt_clc <- st_transform(site_pt_wgs, clc_crs)
-  
-  site_extract <- final_long %>% filter(pop == site_to_run)
+  site_extract <- final_long %>% filter(pop_id == site_to_run)
   
   # Skip if no data for this site
   if (nrow(site_extract) == 0) {
@@ -536,12 +528,11 @@ clc_site_sin <- project(clc_site_nat, sin_crs, method = "near")
     geom_sf(data = site_pixel_sf, aes(fill = Onset_Greenness_Increase),
             colour = "grey35", linewidth = 0.15) +
     geom_sf(data = site_buf_sin, fill = NA, colour = "red", linewidth = 0.8) +
-    geom_sf(data = site_pt_sin, shape = 4, size = 3.5, stroke = 1.2, colour = "black") +
     scale_fill_gradientn(colours = hcl.colors(100, "RdYlGn"),
                          name = "Day of year", na.value = "grey80") +
     coord_sf(crs = sin_crs) +
     labs(title = paste0(site_to_run, " — LSP Onset of Greenness (", target_year, ")"),
-         subtitle = "Grey lines = VIIRS pixel borders; X = sampling point") +
+         subtitle = "Grey lines = VIIRS pixel borders") +
     theme_minimal(base_size = 10)
 
 # Replace the p2 block with this:
@@ -549,7 +540,6 @@ p2 <- ggplot() +
   tidyterra::geom_spatraster(data = clc_site_nat, aes(fill = clc_name)) +
   geom_sf(data = site_pixel_clc, fill = NA, colour = "grey35", linewidth = 0.15) +
   geom_sf(data = site_buf_clc,   fill = NA, colour = "red",    linewidth = 0.8) +
-  geom_sf(data = site_pt_clc,    shape = 4, size = 3.5, stroke = 1.2, colour = "black") +
   scale_fill_manual(
     values    = clc_palette,
     drop      = FALSE,
@@ -564,7 +554,6 @@ p2 <- ggplot() +
     geom_sf(data = site_pixel_sf, aes(fill = clc_label),
             colour = "grey35", linewidth = 0.15) +
     geom_sf(data = site_buf_sin, fill = NA, colour = "red", linewidth = 0.8) +
-    geom_sf(data = site_pt_sin, shape = 4, size = 3.5, stroke = 1.2, colour = "black") +
     scale_fill_manual(values = clc_palette, drop = FALSE,
                       na.value = "grey80", name = "CLC class", guide = "none") +
     coord_sf(crs = sin_crs) +
@@ -579,7 +568,6 @@ p2 <- ggplot() +
       tidyterra::geom_spatraster_rgb(data = sat_rgb) +
       geom_sf(data = site_pixel_wgs, fill = NA, colour = "grey35", linewidth = 0.15) +
       geom_sf(data = site_buf_wgs, fill = NA, colour = "red", linewidth = 0.8) +
-      geom_sf(data = site_pt_wgs, shape = 4, size = 3.5, stroke = 1.2, colour = "black") +
       coord_sf(crs = wgs_crs, expand = FALSE) +
       labs(title = "Satellite image (ESRI World Imagery)") +
       theme_minimal(base_size = 10)
@@ -592,7 +580,7 @@ p2 <- ggplot() +
   combined <- (p1 | p4) / (p2 | p3) +
     plot_annotation(
       title   = paste0("Site: ", site_to_run, " | ", target_year),
-      caption = "Red box = 5×5 km buffer | Grey lines = VIIRS pixel borders | X = sampling point"
+      caption = "Red box = 3.33×3.33 km buffer | Grey lines = VIIRS pixel borders"
     )
 
   ggsave(
